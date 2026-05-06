@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+CONFIG="${ROOT_DIR}/config/sing-box.tun.json"
+
+find_sing_box() {
+  if command -v sing-box >/dev/null 2>&1; then
+    command -v sing-box
+    return 0
+  fi
+
+  if [ -x "${HOME}/bin/sing-box" ]; then
+    printf '%s\n' "${HOME}/bin/sing-box"
+    return 0
+  fi
+
+  printf 'sing-box not found. Install it or put it in PATH / ~/bin.\n' >&2
+  return 1
+}
+
+if [ ! -f "${CONFIG}" ]; then
+  printf 'Missing %s\n' "${CONFIG}" >&2
+  printf 'Copy config/sing-box.tun.example.json to config/sing-box.tun.json and fill your VLESS settings.\n' >&2
+  exit 1
+fi
+
+SING_BOX="$(find_sing_box)"
+"${SING_BOX}" check -c "${CONFIG}"
+
+exec sudo "${SING_BOX}" run -c "${CONFIG}"

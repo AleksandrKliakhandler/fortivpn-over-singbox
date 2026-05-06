@@ -1,0 +1,13 @@
+# Keep real local proxy/VPN configs out of git.
+config/*.json
+!config/*.example.json
+
+# Local logs and runtime scratch.
+*.log
+logs/
+state/
+tmp/
+
+# macOS/editor noise.
+.DS_Store
+*~

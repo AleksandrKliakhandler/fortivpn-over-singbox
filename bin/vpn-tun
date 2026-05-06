@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import pwd
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Optional
+
+
+def runtime_user() -> str:
+    return os.environ.get("VPN_TUN_USER") or os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+
+
+USER = runtime_user()
+USER_INFO = pwd.getpwnam(USER)
+USER_HOME = Path(USER_INFO.pw_dir)
+SCRIPT = Path(os.environ.get("VPN_TUN_SCRIPT", Path(__file__).resolve()))
+IFACE = os.environ.get("VPN_TUN_IFACE", "ppp0")
+OPENFORTIVPN_PROXY = os.environ.get("VPN_TUN_PROXY", os.environ.get("SING_BOX_HTTP_PROXY", "http://127.0.0.1:10809"))
+
+RUNDIR = Path(os.environ.get("VPN_TUN_RUNDIR", "/tmp/vpn-tun-wrapper"))
+LOGFILE = Path(os.environ.get("VPN_TUN_LOGFILE", "/tmp/vpn-tun.log"))
+RUNFILE = RUNDIR / "keepalive"
+LOCKDIR = RUNDIR / "supervisor.lock"
+SUPERVISOR_PID = RUNDIR / "supervisor.pid"
+OPENFORTIVPN_PID = RUNDIR / "openfortivpn.pid"
+HEARTBEAT = RUNDIR / "heartbeat"
+STATE = RUNDIR / "state.json"
+PINENTRY = RUNDIR / "vpn-pinentry"
+
+START_TIMEOUT = int(os.environ.get("VPN_TUN_START_TIMEOUT", "180"))
+CONNECT_TIMEOUT = int(os.environ.get("VPN_TUN_CONNECT_TIMEOUT", "120"))
+START_GRACE = int(os.environ.get("VPN_TUN_START_GRACE", "5"))
+RECONNECT_DELAY = int(os.environ.get("VPN_TUN_RECONNECT_DELAY", "3"))
+HEARTBEAT_MAX_AGE = int(os.environ.get("VPN_TUN_HEARTBEAT_MAX_AGE", "60"))
+POLL_INTERVAL = float(os.environ.get("VPN_TUN_POLL_INTERVAL", "1.0"))
+LOST_IFACE_GRACE = int(os.environ.get("VPN_TUN_LOST_IFACE_GRACE", "5"))
+STOP_TIMEOUT = int(os.environ.get("VPN_TUN_STOP_TIMEOUT", "8"))
+
+
+def ensure_rundir() -> None:
+    RUNDIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(RUNDIR, 0o777)
+
+
+def atomic_write(path: Path, data: str, mode: int = 0o666) -> None:
+    ensure_rundir()
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def log_line(message: str) -> None:
+    timestamp = time.strftime("[%a %b %d %H:%M:%S %z %Y]")
+    with open(LOGFILE, "a", encoding="utf-8") as fh:
+        fh.write(f"{timestamp} {message}\n")
+
+
+def remove_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_pid(path: Path, pid: int) -> None:
+    atomic_write(path, f"{pid}\n", mode=0o644)
+
+
+def read_pid(path: Path) -> Optional[int]:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def process_running(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def heartbeat_touch() -> None:
+    ensure_rundir()
+    HEARTBEAT.touch()
+    os.chmod(HEARTBEAT, 0o666)
+
+
+def heartbeat_recent() -> bool:
+    try:
+        return time.time() - HEARTBEAT.stat().st_mtime <= HEARTBEAT_MAX_AGE
+    except FileNotFoundError:
+        return False
+
+
+def write_state(status: str, attempt: int = 0, message: str = "") -> None:
+    payload = {
+        "status": status,
+        "attempt": attempt,
+        "message": message,
+        "updated_at": time.time(),
+        "hostname": socket.gethostname(),
+        "user": USER,
+        "iface": IFACE,
+    }
+    atomic_write(STATE, json.dumps(payload) + "\n", mode=0o666)
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"status": "down", "attempt": 0, "message": ""}
+
+
+def user_path(name: str) -> Optional[Path]:
+    candidate = USER_HOME / "bin" / name
+    return candidate if candidate.exists() and os.access(candidate, os.X_OK) else None
+
+
+def find_openfortivpn() -> Path:
+    configured = os.environ.get("VPN_TUN_OPENFORTIVPN")
+    if configured:
+        path = Path(configured).expanduser()
+        if path.exists() and os.access(path, os.X_OK):
+            return path
+        raise SystemExit(f"Configured VPN_TUN_OPENFORTIVPN is not executable: {path}")
+
+    for name in ["openfortivpnx", "openfortivpn"]:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+        user_bin = user_path(name)
+        if user_bin:
+            return user_bin
+        for directory in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
+            candidate = directory / name
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return candidate
+
+    raise SystemExit("openfortivpnx/openfortivpn not found. Install one of them or put it in PATH / ~/bin.")
+
+
+def vpn_config_from_env() -> Optional[Path]:
+    value = os.environ.get("VPN_TUN_CONFIG") or os.environ.get("OPENFORTIVPN_CONFIG")
+    return Path(value).expanduser() if value else None
+
+
+def extra_args_from_env() -> list[str]:
+    return shlex.split(os.environ.get("VPN_TUN_OPENFORTIVPN_ARGS", ""))
+
+
+def vpn_ifconfig() -> str:
+    proc = subprocess.run(
+        ["ifconfig", IFACE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def vpn_is_up() -> bool:
+    return "inet " in vpn_ifconfig()
+
+
+def acquire_lock() -> bool:
+    ensure_rundir()
+    try:
+        LOCKDIR.mkdir()
+        write_pid(SUPERVISOR_PID, os.getpid())
+        return True
+    except FileExistsError:
+        old_pid = read_pid(SUPERVISOR_PID)
+        if process_running(old_pid):
+            log_line(f"Another supervisor is already running as PID {old_pid}; exiting.")
+            return False
+        try:
+            LOCKDIR.rmdir()
+        except OSError:
+            pass
+        try:
+            LOCKDIR.mkdir()
+            write_pid(SUPERVISOR_PID, os.getpid())
+            return True
+        except OSError as exc:
+            log_line(f"Could not acquire supervisor lock: {exc}")
+            return False
+
+
+def release_lock() -> None:
+    if read_pid(SUPERVISOR_PID) == os.getpid():
+        remove_file(SUPERVISOR_PID)
+        try:
+            LOCKDIR.rmdir()
+        except OSError:
+            pass
+
+
+def ensure_pinentry() -> Path:
+    script = f"#!/bin/sh\nexec {shlex.quote(str(SCRIPT))} _pinentry\n"
+    atomic_write(PINENTRY, script, mode=0o755)
+    return PINENTRY
+
+
+def supports_arg(binary: Path, arg: str) -> bool:
+    try:
+        proc = subprocess.run(
+            [str(binary), "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return arg in proc.stdout
+
+
+def openfortivpn_args() -> list[str]:
+    binary = find_openfortivpn()
+    config = vpn_config_from_env()
+    if not config:
+        raise SystemExit("Missing VPN config. Use: vpn-tun u /path/to/openfortivpn.conf")
+    if not config.exists():
+        raise SystemExit(f"Missing VPN config: {config}")
+
+    args = [
+        str(binary),
+        "-c",
+        str(config),
+        "--pinentry",
+        str(ensure_pinentry()),
+    ]
+    if supports_arg(binary, "--ftm-push-otp-prompt"):
+        args.append("--ftm-push-otp-prompt")
+    args.extend(extra_args_from_env())
+    return args
+
+
+def openfortivpn_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["HTTPS_PROXY"] = OPENFORTIVPN_PROXY
+    env["https_proxy"] = OPENFORTIVPN_PROXY
+    return env
+
+
+def stop_process(pid: Optional[int], sig: int = signal.SIGTERM) -> None:
+    if not process_running(pid):
+        return
+    try:
+        os.kill(pid or 0, sig)
+    except OSError:
+        pass
+
+
+def run_openfortivpn_attempt(attempt: int) -> tuple[int, bool]:
+    write_state("connecting", attempt=attempt, message="Connecting")
+    log_line(f"Connecting attempt {attempt}...")
+    log_line(f"Using HTTPS proxy {OPENFORTIVPN_PROXY}.")
+    connect_deadline = time.time() + CONNECT_TIMEOUT
+
+    with open(LOGFILE, "a", encoding="utf-8") as logfh:
+        proc = subprocess.Popen(
+            openfortivpn_args(),
+            stdout=logfh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            text=True,
+            env=openfortivpn_env(),
+        )
+
+    write_pid(OPENFORTIVPN_PID, proc.pid)
+    lost_iface_since: Optional[float] = None
+    saw_up = False
+
+    while proc.poll() is None:
+        heartbeat_touch()
+
+        if not RUNFILE.exists():
+            stop_process(proc.pid)
+            break
+
+        if vpn_is_up():
+            if not saw_up:
+                log_line(f"{IFACE} interface is up.")
+            saw_up = True
+            lost_iface_since = None
+            write_state("up", attempt=attempt, message="Tunnel is up")
+        else:
+            if saw_up:
+                if lost_iface_since is None:
+                    lost_iface_since = time.time()
+                    write_state("reconnecting", attempt=attempt, message=f"{IFACE} disappeared")
+                    log_line(f"{IFACE} disappeared; waiting briefly before reconnect.")
+                elif time.time() - lost_iface_since >= LOST_IFACE_GRACE:
+                    write_state("reconnecting", attempt=attempt, message=f"{IFACE} is still down")
+                    log_line(f"{IFACE} is still down; terminating VPN client to reconnect.")
+                    stop_process(proc.pid)
+                    break
+            else:
+                write_state("connecting", attempt=attempt, message="Waiting for tunnel")
+                if time.time() >= connect_deadline:
+                    write_state("down", attempt=attempt, message="Connect timed out")
+                    log_line(f"Connect timed out after {CONNECT_TIMEOUT}s; stopping.")
+                    remove_file(RUNFILE)
+                    stop_process(proc.pid)
+                    break
+
+        time.sleep(POLL_INTERVAL)
+
+    rc = proc.returncode
+    if rc is None:
+        try:
+            rc = proc.wait(timeout=STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            stop_process(proc.pid, signal.SIGKILL)
+            rc = proc.wait()
+
+    remove_file(OPENFORTIVPN_PID)
+    log_line(f"VPN client exited with code {rc}.")
+    return rc, saw_up
+
+
+def supervisor_loop() -> int:
+    ensure_rundir()
+    if not acquire_lock():
+        return 0
+
+    running = True
+
+    def handle_signal(_signum, _frame) -> None:
+        nonlocal running
+        running = False
+        remove_file(RUNFILE)
+        stop_process(read_pid(OPENFORTIVPN_PID))
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    RUNFILE.touch()
+    os.chmod(RUNFILE, 0o666)
+    heartbeat_touch()
+    LOGFILE.write_text("", encoding="utf-8")
+    os.chmod(LOGFILE, 0o666)
+
+    attempt = 0
+    try:
+        while running and RUNFILE.exists():
+            attempt += 1
+            rc, saw_up = run_openfortivpn_attempt(attempt)
+            if not running or not RUNFILE.exists():
+                break
+            if not saw_up:
+                write_state("down", attempt=attempt, message=f"Connect failed rc={rc}")
+                log_line("Connect failed before tunnel came up; stopping supervisor.")
+                remove_file(RUNFILE)
+                break
+            write_state("reconnecting", attempt=attempt, message=f"Disconnected rc={rc}")
+            log_line(f"Reconnecting in {RECONNECT_DELAY}s...")
+            time.sleep(RECONNECT_DELAY)
+    except Exception:
+        write_state("down", attempt=attempt, message="Supervisor crashed")
+        log_line("Supervisor crashed:")
+        for line in traceback.format_exc().splitlines():
+            log_line(line)
+        raise
+    finally:
+        write_state("down", attempt=attempt, message="Supervisor stopped")
+        log_line("Stopped.")
+        remove_file(OPENFORTIVPN_PID)
+        remove_file(RUNFILE)
+        remove_file(HEARTBEAT)
+        release_lock()
+
+    return 0
+
+
+def stop_root() -> int:
+    remove_file(RUNFILE)
+
+    supervisor_pid = read_pid(SUPERVISOR_PID)
+    openfortivpn_pid = read_pid(OPENFORTIVPN_PID)
+    stop_process(supervisor_pid)
+    stop_process(openfortivpn_pid)
+
+    deadline = time.time() + STOP_TIMEOUT
+    while time.time() < deadline:
+        if not process_running(supervisor_pid) and not process_running(openfortivpn_pid):
+            break
+        time.sleep(0.2)
+
+    if process_running(openfortivpn_pid):
+        stop_process(openfortivpn_pid, signal.SIGKILL)
+    if process_running(supervisor_pid):
+        stop_process(supervisor_pid, signal.SIGKILL)
+
+    for path in [SUPERVISOR_PID, OPENFORTIVPN_PID, HEARTBEAT, RUNFILE]:
+        remove_file(path)
+    try:
+        LOCKDIR.rmdir()
+    except OSError:
+        pass
+    write_state("down", message="Stopped by user")
+    return 0
+
+
+def sudo_env(config: Path, extra_args: list[str]) -> list[str]:
+    env_pairs = {
+        "VPN_TUN_USER": USER,
+        "VPN_TUN_SCRIPT": str(SCRIPT),
+        "VPN_TUN_CONFIG": str(config),
+        "VPN_TUN_PROXY": OPENFORTIVPN_PROXY,
+        "VPN_TUN_IFACE": IFACE,
+        "VPN_TUN_OPENFORTIVPN_ARGS": shlex.join(extra_args),
+    }
+    configured_client = os.environ.get("VPN_TUN_OPENFORTIVPN")
+    if configured_client:
+        env_pairs["VPN_TUN_OPENFORTIVPN"] = configured_client
+    return [f"{key}={value}" for key, value in env_pairs.items()]
+
+
+def launch_supervisor(config: Path, extra_args: list[str]) -> bool:
+    ensure_rundir()
+    remove_file(SUPERVISOR_PID)
+    remove_file(HEARTBEAT)
+
+    with open(LOGFILE, "a", encoding="utf-8") as logfh:
+        subprocess.Popen(
+            ["sudo", *sudo_env(config, extra_args), str(SCRIPT), "_supervisor"],
+            stdout=logfh,
+            stderr=logfh,
+            stdin=subprocess.DEVNULL,
+        )
+
+    deadline = time.time() + START_GRACE
+    while time.time() < deadline:
+        if process_running(read_pid(SUPERVISOR_PID)) or HEARTBEAT.exists():
+            return True
+        time.sleep(0.2)
+
+    log_line("Supervisor failed to appear after launch.")
+    return False
+
+
+def wait_for_start() -> int:
+    deadline = time.time() + START_TIMEOUT
+    while time.time() < deadline:
+        if vpn_is_up():
+            return 0
+
+        supervisor_pid = read_pid(SUPERVISOR_PID)
+        state = read_state()
+        if (
+            not process_running(supervisor_pid)
+            and not heartbeat_recent()
+            and state.get("status") == "down"
+        ):
+            return 1
+
+        time.sleep(1)
+
+    return 2
+
+
+def tail_log(lines: int = 40) -> None:
+    try:
+        content = LOGFILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        print("No log file yet.")
+        return
+    for line in content[-lines:]:
+        print(line)
+
+
+def cmd_up(config: Optional[Path], extra_args: list[str]) -> int:
+    if not config:
+        print("Missing VPN config. Use: vpn-tun u /path/to/openfortivpn.conf", file=sys.stderr)
+        return 1
+    if not config.exists():
+        print(f"Missing VPN config: {config}", file=sys.stderr)
+        return 1
+
+    ensure_rundir()
+    subprocess.run(["sudo", "-v"], check=True)
+
+    if vpn_is_up() and heartbeat_recent() and process_running(read_pid(SUPERVISOR_PID)):
+        print("VPN is already running.")
+        return 0
+
+    subprocess.run(["sudo", str(SCRIPT), "_stop-root"], check=False)
+
+    print("Starting VPN. Approve push or enter OTP in the macOS prompt...")
+    if not launch_supervisor(config, extra_args):
+        print(f"Failed to start VPN. Check {LOGFILE}")
+        tail_log(20)
+        return 1
+
+    rc = wait_for_start()
+    if rc == 0:
+        print("VPN started.")
+        return 0
+    if rc == 1:
+        print(f"Failed to start VPN. Check {LOGFILE}")
+        tail_log(20)
+        return 1
+
+    print(f"VPN is still connecting or waiting for MFA. Check {LOGFILE}")
+    return 2
+
+
+def cmd_down() -> int:
+    subprocess.run(["sudo", str(SCRIPT), "_stop-root"], check=False)
+    print("VPN stopped.")
+    return 0
+
+
+def cmd_status() -> int:
+    state = read_state()
+    supervisor_ok = heartbeat_recent() and process_running(read_pid(SUPERVISOR_PID))
+
+    if vpn_is_up() and supervisor_ok:
+        print("VPN: up")
+        return 0
+
+    if vpn_is_up():
+        print("VPN: stale")
+        print("(interface is up, but supervisor is not active)")
+        return 0
+
+    status = state.get("status", "down")
+    print("VPN: down")
+    if status in {"connecting", "reconnecting"} and supervisor_ok:
+        print(f"({status}: {state.get('message', '')})")
+    return 0
+
+
+def run_osascript(script: str) -> str:
+    command = [
+        "/bin/launchctl",
+        "asuser",
+        str(USER_INFO.pw_uid),
+        "/usr/bin/sudo",
+        "-u",
+        USER,
+        "/usr/bin/osascript",
+        "-",
+    ]
+    proc = subprocess.run(
+        command,
+        input=script,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+
+def pinentry_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "").replace("\n", "").replace("+", "%2B")
+
+
+def pinentry_unescape(value: str) -> str:
+    out = ""
+    idx = 0
+    while idx < len(value):
+        if value[idx] == "%" and idx + 2 < len(value):
+            try:
+                out += chr(int(value[idx + 1 : idx + 3], 16))
+                idx += 3
+                continue
+            except ValueError:
+                pass
+        out += " " if value[idx] == "+" else value[idx]
+        idx += 1
+    return out
+
+
+def applescript_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def pinentry_loop() -> int:
+    prompt = "Two-factor authentication token (leave empty to use FTM push):"
+    print("OK vpn-pinentry ready", flush=True)
+
+    for raw_line in sys.stdin:
+        line = raw_line.rstrip("\n")
+
+        if line.startswith("SETPROMPT "):
+            prompt = pinentry_unescape(line[len("SETPROMPT ") :])
+            print("OK", flush=True)
+        elif line == "GETPIN":
+            script = f'''
+set dialogText to "{applescript_string(prompt)}"
+try
+  set resultDialog to display dialog dialogText default answer "" with title "VPN MFA" buttons {{"Use Push", "Use OTP"}} default button "Use OTP" with hidden answer
+  if button returned of resultDialog is "Use Push" then
+    return ""
+  else
+    return text returned of resultDialog
+  end if
+on error
+  return ""
+end try
+'''
+            answer = run_osascript(script)
+            print(f"D {pinentry_escape(answer)}", flush=True)
+            print("OK", flush=True)
+        elif line == "BYE":
+            print("OK", flush=True)
+            return 0
+        else:
+            print("OK", flush=True)
+
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="vpn-tun",
+        description="Run openfortivpn/openfortivpnx through the local sing-box HTTP proxy.",
+    )
+    parser.add_argument("command", nargs="?", default="help")
+    parser.add_argument("config", nargs="?")
+    parser.add_argument("extra", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def usage() -> None:
+    print("Usage: vpn-tun {u|d|status|log} [openfortivpn.conf] [-- extra openfortivpn args]")
+    print("Aliases: up = u, down = d")
+    print("Config can also be set with VPN_TUN_CONFIG or OPENFORTIVPN_CONFIG.")
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "_pinentry":
+        return pinentry_loop()
+
+    args = parse_args()
+    cmd = args.command
+
+    if cmd in {"u", "up", "start"}:
+        config = Path(args.config).expanduser() if args.config else vpn_config_from_env()
+        extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
+        return cmd_up(config, extra)
+    if cmd in {"d", "down", "stop"}:
+        return cmd_down()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "log":
+        tail_log()
+        return 0
+    if cmd == "_supervisor":
+        return supervisor_loop()
+    if cmd == "_stop-root":
+        return stop_root()
+
+    usage()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
