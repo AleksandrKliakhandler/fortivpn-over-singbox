@@ -53,6 +53,15 @@ vpn up -> curl https://ifconfig.me -> Forti/corporate egress IP
 `vpn-tun` preserves this Forti route policy. It changes only how the Forti
 transport reaches the gateway.
 
+For ordinary public traffic before Forti is up, the sing-box TUN config uses DNS
+hijack plus fake-IP answers so ordinary domains are routed by domain through
+the proxy instead of being resolved by the local/provider DNS.
+
+Corporate DNS suffixes are excluded from fake-IP and resolved through Forti DNS
+servers once `vpn-tun` is up. This is required for command-line tools such as
+`kubectl`, which need real internal IPs for the Kubernetes API and OIDC/Dex
+endpoints.
+
 ## Expected IP Checks
 
 - `sing-box` TUN only: `ifconfig.me` shows the VLESS server IP.

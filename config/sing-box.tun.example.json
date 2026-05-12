@@ -8,6 +8,11 @@
   "dns": {
     "servers": [
       {
+        "tag": "fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15"
+      },
+      {
         "tag": "cloudflare",
         "type": "https",
         "server": "cloudflare-dns.com",
@@ -18,6 +23,16 @@
         "tag": "bootstrap",
         "type": "udp",
         "server": "1.1.1.1"
+      },
+      {
+        "tag": "corp-primary",
+        "type": "udp",
+        "server": "10.0.0.53"
+      },
+      {
+        "tag": "corp-secondary",
+        "type": "udp",
+        "server": "10.0.0.54"
       }
     ],
     "rules": [
@@ -26,11 +41,42 @@
           "proxy.example.com"
         ],
         "server": "bootstrap"
+      },
+      {
+        "domain_suffix": [
+          "vpn.prod.example",
+          "vpn.data.example",
+          "vpn.corp.example",
+          "company.example.com"
+        ],
+        "server": "corp-primary"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "fakeip"
       }
     ],
-    "strategy": "ipv4_only"
+    "strategy": "ipv4_only",
+    "final": "cloudflare"
   },
   "inbounds": [
+    {
+      "type": "direct",
+      "tag": "dns-in",
+      "listen": "127.0.0.1",
+      "listen_port": 53,
+      "network": "udp"
+    },
+    {
+      "type": "direct",
+      "tag": "dns-tcp-in",
+      "listen": "127.0.0.1",
+      "listen_port": 53,
+      "network": "tcp"
+    },
     {
       "type": "tun",
       "tag": "tun-in",
@@ -102,6 +148,17 @@
   ],
   "route": {
     "rules": [
+      {
+        "inbound": [
+          "dns-in",
+          "dns-tcp-in"
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
       {
         "action": "sniff"
       },

@@ -113,6 +113,16 @@ TUN mode should make plain `curl` show the proxy server IP:
 curl https://ifconfig.me
 ```
 
+The TUN config hijacks DNS and returns fake-IP answers for A/AAAA queries.
+This keeps browsers from using local/provider DNS for ordinary domains;
+sing-box maps the fake IP back to the domain and resolves it through the
+proxied DoH path.
+
+Corporate DNS suffixes must be placed before the fake-IP A/AAAA rule and sent
+to DNS servers reachable through Forti. This lets tools such as `kubectl`
+resolve corporate endpoints to real internal IPs while ordinary public domains
+continue to use fake-IP routing.
+
 Logs:
 
 ```sh
@@ -140,3 +150,15 @@ by git:
 ```sh
 sing-box check -c config/sing-box.tun.json
 ```
+
+After both `sing-tun` and `vpn-tun` are up, useful checks are:
+
+```sh
+dig @127.0.0.1 -p 53 www.google.com A
+dig @127.0.0.1 -p 53 dex.company.example.com A
+nc -vz -G 8 api.k8s.vpn.prod.example 6443
+kubectl --request-timeout=12s get --raw=/version
+```
+
+Public domains should return `198.18.x.x` fake-IP answers. Corporate domains
+should return real internal addresses, not fake-IP answers.
